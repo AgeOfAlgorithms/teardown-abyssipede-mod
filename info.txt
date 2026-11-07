@@ -1,0 +1,5 @@
+name = Abyssipede
+author = AgeOfAlgorithms and Claude
+description = Something long is moving in the dark. The Abyssipede, a 17 m armoured centipede with glowing back markings and venom claws, hunts you on any map. It swims through flooded wrecks and flies through the air on land, slips through doors and corridors, and bites through whatever is in its way. It follows your light and your noise. If its claws close on you, it drags you back to its lair, and only hurting it makes it let go. Shoot it, blow it up, hit it with a sledge. Set how many hunt in Options (1-3); the host can place more from the spawn menu.
+tags = Gameplay
+version = 2
