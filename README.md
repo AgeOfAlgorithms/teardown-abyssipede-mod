@@ -26,6 +26,10 @@ The host turns it on under Global mods. Each player's game draws the body itself
 ## For mod and map makers
 Your own weapons can hurt it through two registry strings on the host: **abyssipede.hitpoints** (where its hit points are, written every tick) and **abyssipede.damage** (append "x y z amount;" per hit).
 
+## Community
+
+Join the [Discord community](https://discord.gg/gNpRewdkxf) to post bug reports and suggestions.
+
 ## Install
 
 Subscribe on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3833158470), or clone this repository into
