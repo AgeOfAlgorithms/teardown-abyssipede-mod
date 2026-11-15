@@ -9,6 +9,7 @@
 WormView = {}
 
 VIEW_PARK = Vec(0, -1000, 0)
+WV_ZERO = {0, 0, 0}             -- (read only)
 SOUND_KINDS = {"chitter", "click", "hiss", "shriek", "snap", "slither", "growl", "grab", "hurt", "death", "idle"}
 
 local function dist(a, b) return VecLength(VecSub(a, b)) end
@@ -158,12 +159,69 @@ end
 
 -- a rotation whose local +z is fwd (the models' front), rolled by `roll` radians about it
 function wvRot(fwd, roll)
-	local up = Vec(0, 1, 0)
-	if math.abs(fwd[2]) > 0.97 then up = Vec(1, 0, 0) end
-	local x = VecNormalize(VecCross(up, fwd))
-	local y = VecCross(fwd, x)
+	local fx, fy, fz = fwd[1], fwd[2], fwd[3]
+	local x1, x2, x3                                             -- x = normalize(up x fwd), y = fwd x x
+	if math.abs(fy) > 0.97 then x1, x2, x3 = 0, -fz, fy else x1, x2, x3 = fz, 0, -fx end
+	local l = math.sqrt(x1 * x1 + x2 * x2 + x3 * x3)
+	if l < 1e-9 then l = 1 end
+	x1, x2, x3 = x1 / l, x2 / l, x3 / l
+	local y1, y2, y3 = fy * x3 - fz * x2, fz * x1 - fx * x3, fx * x2 - fy * x1
 	local c, s = math.cos(roll), math.sin(roll)
-	return QuatAlignXZ(VecAdd(VecScale(x, c), VecScale(y, s)), fwd)
+	return QuatAlignXZ({x1 * c + y1 * s, x2 * c + y2 * s, x3 * c + y3 * s}, fwd)
+end
+
+-- The trail walked once per frame for every body part (wvAt started at the head again for each of the 42 parts
+-- and made vectors at every step: the biggest share of the pose's cost, measured in-game 2026-11-11): wvWalk
+-- measures the trail's legs once, wvAtW keeps its place between calls (the parts come in rising arc length; a
+-- smaller s starts over). Position and forward (toward the head) at arc length s, as wvAt gives them.
+function wvWalk(tr)
+	local n = math.floor(#tr / 3)
+	local L = {}
+	for k = 1, n - 1 do
+		local i = 3 * k
+		local dx, dy, dz = tr[i - 2] - tr[i + 1], tr[i - 1] - tr[i + 2], tr[i] - tr[i + 3]
+		L[k] = math.sqrt(dx * dx + dy * dy + dz * dz)
+	end
+	return {tr = tr, n = n, L = L, k = 1, acc = 0}
+end
+
+function wvAtW(wk, s)
+	local tr, n, L = wk.tr, wk.n, wk.L
+	if n < 2 then return {tr[1] or 0, tr[2] or 0, tr[3] or 0}, {0, 0, 1} end
+	if s < wk.acc then wk.k, wk.acc = 1, 0 end
+	local k, acc = wk.k, wk.acc
+	while k < n - 1 and acc + L[k] < s do
+		acc = acc + L[k]
+		k = k + 1
+	end
+	wk.k, wk.acc = k, acc
+	local l = L[k]
+	local i = 3 * k
+	local ax, ay, az, bx, by, bz = tr[i - 2], tr[i - 1], tr[i], tr[i + 1], tr[i + 2], tr[i + 3]
+	if l <= 0.0001 then return {ax, ay, az}, {0, 0, 1} end
+	local f = (s - acc) / l
+	if f < 0 then f = 0 elseif f > 1 then f = 1 end
+	return {ax + (bx - ax) * f, ay + (by - ay) * f, az + (bz - az) * f}, {(ax - bx) / l, (ay - by) / l, (az - bz) / l}
+end
+
+-- wvAtW without tables: x, y, z, fx, fy, fz
+function wvAtN(wk, s)
+	local tr, n, L = wk.tr, wk.n, wk.L
+	if n < 2 then return tr[1] or 0, tr[2] or 0, tr[3] or 0, 0, 0, 1 end
+	if s < wk.acc then wk.k, wk.acc = 1, 0 end
+	local k, acc = wk.k, wk.acc
+	while k < n - 1 and acc + L[k] < s do
+		acc = acc + L[k]
+		k = k + 1
+	end
+	wk.k, wk.acc = k, acc
+	local l = L[k]
+	local i = 3 * k
+	local ax, ay, az, bx, by, bz = tr[i - 2], tr[i - 1], tr[i], tr[i + 1], tr[i + 2], tr[i + 3]
+	if l <= 0.0001 then return ax, ay, az, 0, 0, 1 end
+	local f = (s - acc) / l
+	if f < 0 then f = 0 elseif f > 1 then f = 1 end
+	return ax + (bx - ax) * f, ay + (by - ay) * f, az + (bz - az) * f, (ax - bx) / l, (ay - by) / l, (az - bz) / l
 end
 
 -- blend two published trails (same order: head first)
@@ -180,14 +238,18 @@ end
 function WormView.clientInit()
 	wvViews = {}
 	wvLastN = -1
+	wvW, wvTook, wvFrame, wvCam = false, false, 0, Vec(0, 0, 0)
 	wvSnaps = {}
 	wvLoadSounds()
 end
 
 function wvTake()
-	local W = shared.worms
+	wvTook = false
+	if shared.wormsN == wvLastN then return end                  -- (a number: reading shared.worms copies all of it)
+	local W = shared.worms   -- (the one read of the table, when it changed)
 	if not W or W.n == wvLastN then return end
 	wvLastN = W.n
+	wvW, wvTook = W, true
 	local t = GetTime()
 	for i = 1, #W do
 		local w = W[i]
@@ -308,6 +370,14 @@ end
 -- a ring's legs: a walking wave along the body driven by how far it has moved; when it stands still (stuck,
 -- frozen, waiting) the legs keep scrabbling, faster when it hunts; single legs jerk on their own; the tail's long
 -- ultimate legs sway; dead, they flail and then curl under
+WV_LEG_STEPS = 64                                              -- steps of the baked walking cycle
+WV_LEG_K = WV_LEG_STEPS / (2 * math.pi)
+WV_JIT = {}                                                    -- baked jitter offsets (a ring picks one per pose)
+for k = 1, 256 do
+	local a = 6.28 * math.random()
+	WV_JIT[k] = {math.cos(a) * math.random(), math.random() - 0.5, math.sin(a) * math.random()}
+end
+
 function wvLegs(v, s, t, dt, agit, still, dead, thrash, slump)
 	for _, l in ipairs(s.legs) do
 		local sg = l.sign
@@ -317,11 +387,16 @@ function wvLegs(v, s, t, dt, agit, still, dead, thrash, slump)
 			lift = 4 * math.sin(t * 0.8 + sg)
 		else
 			local ph = v.travel * 2.8 + v.idlePh - l.k * 0.7 + (sg < 0 and math.pi or 0)
-			sweep = 22 * math.sin(ph)
-			lift = 13 * math.max(0, math.cos(ph)) - 2
+			l.ph = ph
+			if t < l.tw or dead then                                   -- (only the live path needs the angles)
+				sweep = 22 * math.sin(ph)
+				lift = 13 * math.max(0, math.cos(ph)) - 2
+			end
 		end
+		local live = s.ult or dead
 		if t < l.tw then
 			sweep = sweep + l.twA; lift = lift + l.twB
+			live = true
 		elseif math.random() < dt * (0.15 + 1.2 * still + 0.6 * agit) then
 			l.tw = t + 0.08 + math.random() * 0.22; l.twA = (math.random() - 0.5) * 50; l.twB = 10 + math.random() * 30
 		end
@@ -329,21 +404,41 @@ function wvLegs(v, s, t, dt, agit, still, dead, thrash, slump)
 			sweep = 35 * thrash * math.sin(t * 23 + l.k * 1.3 + sg)
 			lift = -40 * slump + 25 * thrash * math.sin(t * 17 + l.k)
 		end
-		-- (+sweep = forward: the left leg (+x) turns toward +z about -y; +lift = up)
-		wvLimb(l, QuatRotateQuat(QuatEuler(0, -sg * sweep, 0), QuatEuler(0, 0, sg * lift)))
+		if live then
+			-- (+sweep = forward: the left leg (+x) turns toward +z about -y; +lift = up)
+			wvLimb(l, QuatRotateQuat(QuatEuler(0, -sg * sweep, 0), QuatEuler(0, 0, sg * lift)))
+		else
+			-- the walking cycle replayed: this leg's finished transform at each of WV_LEG_STEPS steps of the cycle,
+			-- made the first time the step comes up (the maths and seven engine calls a leg, once instead of every pose)
+			local idx = math.floor(l.ph * WV_LEG_K) % WV_LEG_STEPS
+			local bk = l.bake
+			if not bk then bk = {}; l.bake = bk end
+			local T = bk[idx]
+			if not T then
+				local ph = (idx + 0.5) / WV_LEG_K
+				local R = QuatRotateQuat(QuatEuler(0, -sg * 22 * math.sin(ph), 0), QuatEuler(0, 0, sg * (13 * math.max(0, math.cos(ph)) - 2)))
+				T = Transform(VecAdd(l.hinge, QuatRotateVec(R, VecSub(l.rest.pos, l.hinge))), QuatRotateQuat(R, l.rest.rot))
+				bk[idx] = T
+			end
+			SetShapeLocalTransform(l.shape, T)
+		end
 	end
 end
 
 -- side and up vectors of a part facing fwd (as wvRot builds them)
 local function sideUp(f)
-	local up = Vec(0, 1, 0)
-	if math.abs(f[2]) > 0.97 then up = Vec(1, 0, 0) end
-	local x = VecNormalize(VecCross(up, f))
-	return x, VecCross(f, x)
+	local fx, fy, fz = f[1], f[2], f[3]
+	local x1, x2, x3
+	if math.abs(fy) > 0.97 then x1, x2, x3 = 0, -fz, fy else x1, x2, x3 = fz, 0, -fx end
+	local l = math.sqrt(x1 * x1 + x2 * x2 + x3 * x3)
+	if l < 1e-9 then l = 1 end
+	x1, x2, x3 = x1 / l, x2 / l, x3 / l
+	return {x1, x2, x3}, {fy * x3 - fz * x2, fz * x1 - fx * x3, fx * x2 - fy * x1}
 end
 
 function wvPose(v, w, tr, dt)
 	local t = GetTime()
+	v.poseN = (v.poseN or 0) + 1                                 -- (poses of this worm: far ones skip frames)
 	local speed = w.speed or 0
 	v.phase = v.phase + dt * (0.8 + speed * 0.6)
 	local agit = (w.state == "chase" or w.state == "drag" or w.state == "windup" or w.state == "lunge") and 1 or
@@ -365,13 +460,16 @@ function wvPose(v, w, tr, dt)
 	end
 	for k = #v.tw, 1, -1 do if t > v.tw[k].t0 + v.tw[k].dur then table.remove(v.tw, k) end end
 	-- the head
-	local hp, hf = wvAt(tr, 0)
+	local walk = wvWalk(tr)
+	local hp, hf = wvAtW(walk, 0)
 	if w.fx then hf = VecNormalize(Vec(w.fx, w.fy, w.fz)) end
-	local limbs = dist(GetCameraTransform().pos, hp) < 80        -- (limbs only move where someone could see them)
+	local camD = dist(wvCam, hp)
+	local limbs = camD < 80                                    -- (limbs only move where someone could see them)
+	local legEvery = camD < 25 and 1 or 2                      -- (farther off the legs turn every 2nd frame, ring by ring)
 	local jit = 0.01 + 0.025 * agit
 	local function shake(i)
 		local a = 6.28 * math.random()
-		return Vec(math.cos(a) * jit * math.random(), (math.random() - 0.5) * jit, math.sin(a) * jit * math.random())
+		return {math.cos(a) * jit * math.random(), (math.random() - 0.5) * jit, math.sin(a) * jit * math.random()}
 	end
 	local function fall(p, i)
 		if slump <= 0 then return p end
@@ -384,7 +482,7 @@ function wvPose(v, w, tr, dt)
 		return Vec(p[1], p[2] + (v.ground[i] - p[2]) * slump, p[3])
 	end
 	local thr = function(i)
-		if thrash <= 0 then return Vec(0, 0, 0) end
+		if thrash <= 0 then return WV_ZERO end
 		local a = math.sin(t * 17 + i * 0.9) * thrash * 0.35
 		return Vec(a * math.cos(i), math.sin(t * 13 + i) * thrash * 0.2, a * math.sin(i))
 	end
@@ -392,15 +490,16 @@ function wvPose(v, w, tr, dt)
 	local undA = 0.03 + 0.07 * still + 0.02 * agit
 	local undW = 1.4 + 2.2 * agit + 0.8 * still
 	local function life(s, f)
-		if dead then return Vec(0, 0, 0) end
+		if dead then return WV_ZERO end
 		local x, y = sideUp(f)
 		local env = math.min(1, s / 1.2)
-		local o = VecAdd(VecScale(x, undA * env * math.sin(s * 2.1 - t * undW)), VecScale(y, 0.4 * undA * env * math.sin(s * 1.3 + t * 1.1)))
+		local a = undA * env * math.sin(s * 2.1 - t * undW)
+		local b = 0.4 * undA * env * math.sin(s * 1.3 + t * 1.1)
 		for _, tw in ipairs(v.tw) do
 			local m = wvTwitchAt(tw, s, t)
-			if m ~= 0 then o = VecAdd(o, VecScale(VecAdd(VecScale(x, math.cos(tw.a)), VecScale(y, math.sin(tw.a))), m)) end
+			if m ~= 0 then a, b = a + math.cos(tw.a) * m, b + math.sin(tw.a) * m end
 		end
-		return o
+		return {x[1] * a + y[1] * b, x[2] * a + y[2] * b, x[3] * a + y[3] * b}
 	end
 	local headPos = fall(VecAdd(VecAdd(VecAdd(hp, shake(0)), thr(0)), life(0.25, hf)), 0)
 	-- it looks around in jerks (more when still; not while it strikes)
@@ -451,40 +550,117 @@ function wvPose(v, w, tr, dt)
 	local glowBase = w.glow or 0.3
 	if dead then glowBase = math.max(0, 0.8 - dt0 / 7) * (math.random() < 0.15 and 0.2 or 1) end
 	local speedW = (w.state == "lurk") and 2.2 or (w.state == "stalk" and 4 or 7.5)
-	local pos, fwd = {}, {}
+	local pos = {}
+	local fw = v.fw
+	if not fw then fw = {}; v.fw = fw end                        -- (each ring's forward along the trail, flat, kept)
+	local strobe = w.state == "windup" or w.state == "lunge"
+	-- what all rings share this pose: the writhe's two waves at this time, and the twitches under way
+	-- (sin(a - b) = sin a cos b - cos a sin b: each ring keeps the sines of its own place, made once)
+	local sU, cU = math.sin(t * undW), math.cos(t * undW)
+	local sV, cV = math.sin(t * 1.1), math.cos(t * 1.1)
+	local twC, twW, twA, twB = v.twC, v.twW, v.twA, v.twB
+	if not twC then twC, twW, twA, twB = {}, {}, {}, {}; v.twC, v.twW, v.twA, v.twB = twC, twW, twA, twB end
+	local nTw = 0
+	if not dead then
+		for _, tw in ipairs(v.tw) do
+			local u = (t - tw.t0) / tw.dur
+			if u >= 0 and u <= 1 then
+				local f
+				if tw.run > 0 then f = math.sin(math.pi * u) elseif u < 0.2 then f = u / 0.2 else f = ((1 - u) / 0.8) ^ 2 end
+				local m = tw.amp * f
+				nTw = nTw + 1
+				twC[nTw], twW[nTw], twA[nTw], twB[nTw] = tw.c + tw.run * (t - tw.t0), tw.wd, math.cos(tw.a) * m, math.sin(tw.a) * m
+			end
+		end
+	end
+	local exp, abs, sqrt, random = math.exp, math.abs, math.sqrt, math.random
 	for i, s in ipairs(v.segs) do
-		if s.arc > len + 0.3 and not dead then
+		local arc = s.arc
+		if arc > len + 0.3 and not dead then
 			if not s.parked then SetBodyTransform(s.body, Transform(VIEW_PARK)); s.parked = true end
 		else
 			s.parked = false
-			local p, f = wvAt(tr, s.arc)
-			pos[i] = fall(VecAdd(VecAdd(VecAdd(p, shake(i)), thr(i)), life(s.arc, f)), i)
-			fwd[i] = f
+			local px, py, pz, fx, fy, fz = wvAtN(walk, arc)
+			fw[3 * i - 2], fw[3 * i - 1], fw[3 * i] = fx, fy, fz
+			local jv = WV_JIT[random(256)]
+			px, py, pz = px + jv[1] * jit, py + jv[2] * jit, pz + jv[3] * jit
+			if dead then
+				if thrash > 0 then
+					local th = thr(i)
+					px, py, pz = px + th[1], py + th[2], pz + th[3]
+				end
+			else
+				if not s.s21 then
+					s.s21, s.c21, s.s13, s.c13 = math.sin(arc * 2.1), math.cos(arc * 2.1), math.sin(arc * 1.3), math.cos(arc * 1.3)
+					s.env = math.min(1, arc / 1.2)
+				end
+				local a = undA * s.env * (s.s21 * cU - s.c21 * sU)
+				local b = 0.4 * undA * s.env * (s.s13 * cV + s.c13 * sV)
+				for j = 1, nTw do
+					local e = (arc - twC[j]) / twW[j]
+					if e < 3 and e > -3 then
+						local g = exp(-e * e)
+						a, b = a + twA[j] * g, b + twB[j] * g
+					end
+				end
+				-- side (x) and up (y) of a part facing f, as sideUp gives them
+				local x1, x2, x3
+				if abs(fy) > 0.97 then x1, x2, x3 = 0, -fz, fy else x1, x2, x3 = fz, 0, -fx end
+				local l = sqrt(x1 * x1 + x2 * x2 + x3 * x3)
+				if l < 1e-9 then l = 1 end
+				x1, x2, x3 = x1 / l, x2 / l, x3 / l
+				px = px + x1 * a + (fy * x3 - fz * x2) * b
+				py = py + x2 * a + (fz * x1 - fx * x3) * b
+				pz = pz + x3 * a + (fx * x2 - fy * x1) * b
+			end
+			local p = {px, py, pz}
+			if slump > 0 then p = fall(p, i) end
+			pos[i] = p
 		end
 	end
+	local sP, cP = math.sin(v.phase * 1.3), math.cos(v.phase * 1.3)
+	local rollA = 0.06 + 0.14 * agit
 	for i, s in ipairs(v.segs) do
 		if pos[i] then
 			local a = (i == 1) and headPos or pos[i - 1]
-			local f = fwd[i]
+			local fx, fy, fz = fw[3 * i - 2], fw[3 * i - 1], fw[3 * i]
 			if a and pos[i + 1] then
-				local d = VecSub(a, pos[i + 1])
-				if VecLength(d) > 0.05 then f = VecNormalize(d) end
+				local q = pos[i + 1]
+				local dx, dy, dz = a[1] - q[1], a[2] - q[2], a[3] - q[3]
+				local dl = sqrt(dx * dx + dy * dy + dz * dz)
+				if dl > 0.05 then fx, fy, fz = dx / dl, dy / dl, dz / dl end
 			end
-			local roll = math.sin(v.phase * 1.3 - i * 0.35) * (0.06 + 0.14 * agit) + (math.random() - 0.5) * 0.04 * agit
-			SetBodyTransform(s.body, Transform(pos[i], wvRot(f, roll)))
-			if limbs and s.legs and #s.legs > 0 then wvLegs(v, s, t, dt, agit, still, dead, thrash, slump) end
+			if not s.rs then s.rs, s.rc = math.sin(i * 0.35), math.cos(i * 0.35) end
+			local roll = (sP * s.rc - cP * s.rs) * rollA + (random() - 0.5) * 0.04 * agit
+			-- (wvRot, without a call or a table for the forward: x = normalize(up x fwd), y = fwd x x, rolled)
+			local x1, x2, x3
+			if abs(fy) > 0.97 then x1, x2, x3 = 0, -fz, fy else x1, x2, x3 = fz, 0, -fx end
+			local xl = sqrt(x1 * x1 + x2 * x2 + x3 * x3)
+			if xl < 1e-9 then xl = 1 end
+			x1, x2, x3 = x1 / xl, x2 / xl, x3 / xl
+			local y1, y2, y3 = fy * x3 - fz * x2, fz * x1 - fx * x3, fx * x2 - fy * x1
+			local rc, rs = math.cos(roll), math.sin(roll)
+			SetBodyTransform(s.body, Transform(pos[i], QuatAlignXZ({x1 * rc + y1 * rs, x2 * rc + y2 * rs, x3 * rc + y3 * rs}, {fx, fy, fz})))
+			if limbs and s.legs and #s.legs > 0 and (legEvery == 1 or (v.poseN + i) % 2 == 0) then
+				wvLegs(v, s, t, dt * legEvery, agit, still, dead, thrash, slump)
+			end
 			-- glow: a pulse running down the body, each part flickering on its own
-			local fl = v.flick[i]
-			if math.random() < 0.01 * (1 + 3 * agit) then fl.off = t + 0.05 + math.random() * 0.25 end
-			local wave = math.max(0, math.sin(t * speedW - i * 0.45 + fl.phase * 0.15)) ^ 4
-			local g = glowBase * (0.3 + 0.9 * wave)
-			if w.state == "windup" or w.state == "lunge" then g = (math.floor(t * 18 + i * 0.5) % 2 == 0) and 1.6 or 0.2 end
-			if t < fl.off then g = g * 0.05 end
-			if WV_NOGLOW then g = 0 end
-			for _, sh in ipairs(s.shapes) do SetShapeEmissiveScale(sh, g) end
+			-- (every 3rd frame per ring, the rings taking turns; every frame while it strobes before a strike)
+			if strobe or (wvFrame + i) % 3 == 0 then
+				local fl = v.flick[i]
+				if math.random() < 0.03 * (1 + 3 * agit) then fl.off = t + 0.05 + math.random() * 0.25 end
+				local wave = math.max(0, math.sin(t * speedW - i * 0.45 + fl.phase * 0.15)) ^ 4
+				local g = glowBase * (0.3 + 0.9 * wave)
+				if w.state == "windup" or w.state == "lunge" then g = (math.floor(t * 18 + i * 0.5) % 2 == 0) and 1.6 or 0.2 end
+				if t < fl.off then g = g * 0.05 end
+				if WV_NOGLOW then g = 0 end
+				for _, sh in ipairs(s.shapes) do SetShapeEmissiveScale(sh, g) end
+			end
 		end
 	end
-	for _, sh in ipairs(GetBodyShapes(v.head)) do SetShapeEmissiveScale(sh, dead and glowBase or (0.5 + 0.5 * glowBase)) end
+	if wvFrame % 3 == 0 then
+		for _, sh in ipairs(GetBodyShapes(v.head)) do SetShapeEmissiveScale(sh, dead and glowBase or (0.5 + 0.5 * glowBase)) end
+	end
 	-- light on its surroundings: the head, the mouth, three spots along the body
 	if glowBase > 0.02 and not WV_NOLIGHTS then
 		local hpos = GetBodyTransform(v.head).pos
@@ -504,6 +680,8 @@ end
 function WormView.clientTick(dt)
 	wvTake()
 	local t = GetTime()
+	wvFrame = wvFrame + 1
+	wvCam = GetCameraTransform().pos
 	for id, s in pairs(wvSnaps) do
 		if t - (s.seen or 0) > 3 then                              -- (gone from the server's list)
 			if wvViews[id] then wvDelete(wvViews[id]); wvViews[id] = nil end
@@ -514,15 +692,23 @@ function WormView.clientTick(dt)
 			if not v then v = wvSpawn(); wvViews[id] = v end
 			local f = 1
 			if s.prev and s.prevT and s.curT > s.prevT then f = math.min(1, (t - s.curT) / (s.curT - s.prevT)) end
-			local tr = wvBlend(s.prev and s.prev.trail, w.trail, f)
-			local head = wvPose(v, w, tr, dt)
+			-- far from the camera the body is posed every 2nd / 4th frame (the pose is Lua maths for every ring)
+			local hd = dist(wvCam, Vec(w.trail[1] or 0, w.trail[2] or 0, w.trail[3] or 0))
+			local every = hd < 70 and 1 or (hd < 140 and 2 or 4)
+			v.lodDt = (v.lodDt or 0) + dt
+			local head = v.headPos
+			if not head or every == 1 or (wvFrame + id) % every == 0 then
+				local tr = wvBlend(s.prev and s.prev.trail, w.trail, f)
+				head = wvPose(v, w, tr, v.lodDt)
+				v.headPos, v.lodDt = head, 0
+			end
 			wvSounds(v, w, s, head, dt)
 			wvHits(v, w)
 		end
 	end
 	-- the server's list no longer has it: published lists are complete, so drop ids not in the newest one
-	local W = shared.worms
-	if W and W.n == wvLastN then
+	local W = wvW
+	if W and wvTook then
 		local live = {}
 		for i = 1, #W do live[W[i].id] = true end
 		for id in pairs(wvViews) do
@@ -533,8 +719,28 @@ end
 
 function WormView.clientDraw()
 	local me = GetLocalPlayer()
-	local W = shared.worms
+	local W = wvW
 	if not W then return end
+	-- the spawn menu's markers: the seconds until a worm comes out
+	local marks = W.marks
+	if marks then
+		for i = 1, #marks, 4 do
+			local x, y, d = UiWorldToPixel(Vec(marks[i], marks[i + 1] + 0.7, marks[i + 2]))
+			if d > 0 and d < 80 then
+				UiPush()
+				UiTranslate(x, y)
+				UiAlign("center middle")
+				UiFont("bold.ttf", 44)
+				UiColor(0, 0, 0, 0.8)
+				UiTranslate(2, 2)
+				UiText(tostring(math.ceil(marks[i + 3])))
+				UiTranslate(-2, -2)
+				UiColor(0.8, 0.4, 1, 0.6 + 0.4 * math.sin(GetTime() * 8))
+				UiText(tostring(math.ceil(marks[i + 3])))
+				UiPop()
+			end
+		end
+	end
 	for i = 1, #W do
 		local w = W[i]
 		if w.alive and w.grab == me and me ~= 0 then

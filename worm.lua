@@ -218,14 +218,59 @@ end
 
 ----- hit boxes (server): invisible, in WORM_LAYER, mask 0 (bullets find them by query) -----
 
-HIT_BOXES = 9
-HIT_SPACING = 1.8
+HIT_BOXES = 14                -- (9 boxes 1.8 m apart left 1.2 m gaps a weapon passed through)
+HIT_SPACING = 1.15
+MELEE_BASE = 10               -- a blow: this + MELEE_VOX per voxel it took out of the hit boxes, at most MELEE_MAX
+MELEE_VOX = 0.3
+MELEE_MAX = 40                -- (x 1.5 on the head; RELEASE_DMG 26 makes it let go, HP 160)
+
+local function boxVoxels(b)
+	local n = 0
+	if b ~= 0 and IsHandleValid(b) then
+		for _, sh in ipairs(GetBodyShapes(b) or {}) do n = n + (GetShapeVoxelCount(sh) or 0) end
+	end
+	return n
+end
+
+-- A hole in the hit boxes that is not its own bite, a bullet or a blast (those are counted where they happen) is a
+-- blow from some mod's weapon (they MakeHole where the weapon meets something): damage by the voxels gone. Judged
+-- 0.15 s after it is seen, so a bullet's own event is in first. The boxes are made anew after every hole.
+function wormBoxesCheck(w)
+	local t = now()
+	if #w.boxes == 0 or t - (w.boxT or t) < 0.5 then return end
+	if not w.boxFull then                                       -- (not in the spawn frame: the count can read 0 there)
+		w.boxFull = {}
+		for i, b in ipairs(w.boxes) do w.boxFull[i] = boxVoxels(b) end
+		return
+	end
+	local lost, at, head = 0, nil, false
+	for i, b in ipairs(w.boxes) do
+		local l = w.boxFull[i] - boxVoxels(b)
+		if l > 0 then
+			lost = lost + l
+			if not at then at, head = GetBodyTransform(b).pos, i == 1 end
+		end
+	end
+	if lost <= 0 then w.boxLossT = nil; return end
+	if not w.boxLossT then w.boxLossT = t; return end
+	if t - w.boxLossT < 0.15 then return end
+	local t0 = w.boxLossT - 0.3
+	local counted = (wormOwnHoleT or -1e9) > t0 or (w.evDmgT or -1e9) > t0
+	w.boxLossT = nil
+	wormBoxesDelete(w)
+	wormBoxesSpawn(w)
+	wormBoxesMove(w)
+	if not counted then
+		wormDamage(w, math.min(MELEE_MAX, MELEE_BASE + lost * MELEE_VOX) * (head and 1.5 or 1), "melee", at)
+	end
+end
 
 function wormBoxesSpawn(w)
 	w.boxes = {}
+	w.boxT, w.boxFull, w.boxLossT = now(), nil, nil
 	for i = 1, HIT_BOXES do
 		local s = i == 1 and 8 or 6
-		local xml = string.format("<body tags='abyssipedehit'><voxbox tags='invisible unbreakable' pos='%.2f %.2f %.2f' size='%d %d %d' color='0 0 0'/></body>",
+		local xml = string.format("<body tags='abyssipedehit'><voxbox tags='invisible' material='plaster' pos='%.2f %.2f %.2f' size='%d %d %d' color='0 0 0'/></body>",
 			-s * 0.05, -s * 0.05, -s * 0.05, s, s, s)
 		local ents = Spawn(xml, Transform(Vec(0, -500, 0)))
 		for _, e in ipairs(ents or {}) do
@@ -332,6 +377,7 @@ function wormDamage(w, d, kind, point)
 	end
 	w.hp = w.hp - d
 	w.hurtT = now()
+	if kind ~= "melee" then w.evDmgT = now() end                -- (wormBoxesCheck: this hole is counted)
 	w.ev.hurt = w.ev.hurt + 1
 	if w.state == "drag" then w.dmgInDrag = w.dmgInDrag + d end
 	if w.hp <= 0 then
@@ -342,12 +388,77 @@ function wormDamage(w, d, kind, point)
 	end
 end
 
+----- vehicles driven into it -----
+
+-- Nothing of the worm collides with a vehicle (its hit boxes collide with nothing, the body is drawn by the clients),
+-- so a ram is worked out here: a vehicle faster than RAM_MIN whose box reaches a point of the body hurts it by
+-- RAM_DMG per m/s, knocks it back along its trail and loses RAM_SLOW of its own speed.
+RAM_MIN = 4.0                 -- m/s (14 km/h)
+RAM_DMG = 3.0                 -- damage per m/s: 30 at 36 km/h, 60 at 72 km/h (HP 160)
+RAM_SLOW = 0.5                -- of its speed the vehicle keeps
+RAM_CD = 0.6                  -- s between two rams of one vehicle
+
+function wormTakeVehicles()
+	local t = now()
+	if t >= (wormVehT or 0) then
+		wormVehT = t + 1.0
+		wormVehicles = FindVehicles("", true) or {}
+	end
+	wormRamT = wormRamT or {}
+	for _, v in ipairs(wormVehicles or {}) do
+		local body = IsHandleValid(v) and GetVehicleBody(v) or 0
+		if body ~= 0 and t >= (wormRamT[v] or 0) then
+			local vel = GetBodyVelocity(body)
+			local speed = vlen(vel)
+			if speed >= RAM_MIN then
+				local lo, hi = GetBodyBounds(body)
+				local c = VecLerp(lo, hi, 0.5)
+				local reach = math.min(4, 0.5 * math.max(hi[1] - lo[1], hi[3] - lo[3])) + 0.7
+				local hit = false
+				for _, w in ipairs(wormList) do
+					if w.alive then
+						local pts = wormSample(w, 1.0, BODY_LEN)
+						local best, bestP = 1e9, nil
+						for k = 1, #pts, 3 do
+							local q = Vec(pts[k], pts[k + 1], pts[k + 2])
+							local d = dist(c, q)
+							if d < best then best, bestP = d, q end
+						end
+						if best < reach then
+							wormDamage(w, RAM_DMG * speed, "ram", bestP)
+							if w.alive and w.state ~= "drag" then wormRecoil(w, math.min(3, speed * 0.15)) end
+							hit = true
+						end
+					end
+				end
+				if hit then
+					wormRamT[v] = t + RAM_CD
+					SetBodyVelocity(body, VecScale(vel, RAM_SLOW))
+				end
+			end
+		end
+	end
+end
+
+-- Gold for the McPuppet Inventory System: a dead Abyssipede drops coins where it dies. Written to the Inventory's
+-- inventory.dropgold ("x,y,z,amount" entries, space separated; it reads and clears the key every tick) on the host, only
+-- when that mod is running (inventory.present). Nothing happens without it.
+GOLD_DROP = 400
+
+function wormDropGold(w)
+	if not GetBool("inventory.present") then return end
+	local p = VecAdd(w.pos, Vec(0, 0.3, 0))
+	local s = GetString("inventory.dropgold")
+	SetString("inventory.dropgold", (s == "" and "" or s .. " ") .. string.format("%.2f,%.2f,%.2f,%d", p[1], p[2], p[3], GOLD_DROP))
+end
+
 function wormDie(w)
 	if w.grab ~= 0 then wormRelease(w) end
 	w.alive = false
 	w.state = "dead"
 	w.deadT = now()
 	w.ev.die = w.ev.die + 1
+	wormDropGold(w)
 	wormBoxesDelete(w)
 	Nav.cancel(w.id)
 end
@@ -400,6 +511,7 @@ function wormBite(w, dir)
 	w.ev.bite = w.ev.bite + 1
 	local d = dir or w.fwd
 	local p = VecAdd(w.pos, VecScale(d, 0.8))
+	wormOwnHoleT = now()
 	local cut = (MakeHole(p, BITE_R[1], BITE_R[2], BITE_R[3]) or 0)
 		+ (MakeHole(VecAdd(p, VecScale(d, 0.9)), BITE_R[1] * 0.8, BITE_R[2] * 0.8, BITE_R[3] * 0.7, true) or 0)
 	Nav.forget(p, 3)
@@ -464,6 +576,14 @@ function wormSetState(w, s)
 end
 
 function wormSense(w)
+	-- prey that another worm holds, or that sits in a cocoon, is not prey: give it up (it is sensed again like
+	-- anyone else once it is free)
+	local tg = w.target
+	if tg and tg ~= 0 and w.grab ~= tg and wormGrabbed[tg] then
+		w.target, w.seeing = 0, false
+		w.knownT = -1e9
+		if w.state == "chase" or w.state == "stalk" or w.state == "windup" or w.state == "lunge" then wormSetState(w, "lurk") end
+	end
 	local best, bestS = 0, 0
 	local vol, spos
 	local heard = wormHeard                                        -- (the loudest sound since the last sensing)
@@ -530,7 +650,7 @@ function wormWanderGoal(w)
 	-- drawn to life: mostly somewhere near the nearest living player (closer each time it comes back to them)
 	local best, bd = nil, 1e9
 	for _, p in ipairs(GetAllPlayers()) do
-		if GetPlayerHealth(p) > 0 then
+		if GetPlayerHealth(p) > 0 and not wormGrabbed[p] then    -- (not toward prey that is already taken)
 			local d = dist(wormChest(p), w.pos)
 			if d < bd then best, bd = p, d end
 		end
@@ -816,11 +936,48 @@ function wormHold(w)
 	SetPlayerVelocity(w.vel, p)
 end
 
+----- Villagers of Dunmarrow (its API is host registry keys: nothing reads them when that mod is not running) -----
+-- Each Abyssipede is a "thing" for the villagers (villagers.thing.<id>.*: its kind, where it is, what it is doing), so
+-- they can see it, fear it and run from it. API: villagers/mods/villagers/API.md.
+
+function wormVillagersInit()
+	local b = "villagers.kind.abyssipede."
+	SetString(b .. "name", "a glowing giant centipede")
+	SetString(b .. "feel", "fear")
+	SetFloat(b .. "danger", 0.9)
+	SetString(b .. "note", "as long as a house is wide, it glows in the dark, bites through walls and drags people off")
+	SetString(b .. "sound", "a dry clicking")
+	SetFloat(b .. "hear", 25)
+	SetString(b .. "feel.wren", "curious")                  -- Lucy, the reckless apprentice, wants a look
+	SetString(b .. "feel.brannoc", "hate")                  -- Frank the smith and Walter the shepherd stand and fight
+	SetString(b .. "feel.eskil", "hate")
+end
+
+local VL_DOING = {lurk = "crawling about", stalk = "creeping closer", chase = "charging", windup = "rearing up to strike",
+	lunge = "lunging", drag = "dragging someone off", flee = "fleeing", dead = "dead"}
+
+function wormVillagersTick()
+	local t = now()
+	if t < (wormVlT or 0) then return end
+	wormVlT = t + 0.5
+	for _, w in ipairs(wormList) do
+		local b = "villagers.thing.ab" .. tostring(w.id) .. "."
+		if w.alive then
+			SetString(b .. "kind", "abyssipede")
+			SetFloat(b .. "x", w.pos[1]); SetFloat(b .. "y", w.pos[2]); SetFloat(b .. "z", w.pos[3])
+			SetString(b .. "doing", VL_DOING[w.state] or "crawling about")
+		elseif not w.vlGone then
+			w.vlGone = true
+			SetBool(b .. "gone", true)
+		end
+	end
+end
+
 ----- publishing -----
 
 function wormPublish()
 	wormSeq = wormSeq + 1
-	local out = {n = wormSeq}
+	local out = {n = wormSeq, marks = wormMarks or {}}
 	for i, w in ipairs(wormList) do
 		local glow = 0.3
 		if w.state == "stalk" then glow = 0.6 elseif w.state == "chase" or w.state == "drag" then glow = 0.9
@@ -834,6 +991,7 @@ function wormPublish()
 			hits = w.hits or {}}
 	end
 	shared.worms = out
+	shared.wormsN = wormSeq                                    -- (the clients read the table only when this changed)
 end
 
 ----- callbacks -----
@@ -842,6 +1000,7 @@ function Worm.serverInit()
 	wormList = {}
 	wormHitShapes = {}
 	wormGrabbed = {}
+	wormSpawnerTrack, wormMarks = {}, {}
 	wormNextId = 1
 	wormSeq = 0
 	wormPubT = 0
@@ -853,6 +1012,8 @@ function Worm.serverInit()
 	wormHitpointsLast = nil
 	SetString("abyssipede.hitpoints", "")
 	SetString("abyssipede.damage", "")
+	wormVillagersInit()
+	wormVlT = 0
 	local c = GetInt("savegame.mod.count")
 	if c < 1 then c = 1 end
 	WORM_COUNT = math.min(3, c)
@@ -860,11 +1021,13 @@ function Worm.serverInit()
 		local L = WORM_PARTS.head.len or 1
 		for _, s in ipairs(WORM_PARTS.segments) do L = L + s.len end
 		BODY_LEN = L + ((WORM_PARTS.tail and WORM_PARTS.tail.len) or 0)
+		HIT_BOXES = math.max(4, math.ceil(BODY_LEN / HIT_SPACING))   -- (the hit boxes as long as the body)
 	end
 	for _, b in ipairs(FindBodies("abyssipedehit", true) or {}) do Delete(b) end
 	Nav.init({cell = 0.5, radius = 0.3, budget = 300, maxNodes = 6000, mask = WORM_QUERY_MASK})
 	for i = 1, WORM_COUNT do wormRespawnAt[#wormRespawnAt + 1] = SPAWN_DELAY + (i - 1) * 6 end
 	shared.worms = {n = 0}
+	shared.wormsN = 0
 end
 
 -- look for a lair over a few frames: 24 candidates per frame, the best after 2 s
@@ -896,22 +1059,61 @@ function wormSpawnTick()
 end
 
 -- spawn-menu worms: the marker prefab (prefab/spawner.xml) becomes a worm where it was put
+SPAWN_MARK_T = 7              -- s from the spawn menu's marker appearing to the worm coming out of it
+
+-- spawn-menu worms: the marker (prefab/spawner.xml) stays where it was put, and after SPAWN_MARK_T s a worm comes
+-- out of it there (wherever it has rolled to by then). wormMarks = {x, y, z, seconds left, ...} goes to the clients
+-- with shared.worms, for the countdown over each marker.
 function wormSpawnMenu()
+	local t = now()
+	local seen, marks = {}, {}
 	for _, b in ipairs(FindBodies("abyssipedespawn", true) or {}) do
-		local p = VecAdd(GetBodyTransform(b).pos, Vec(0, 1.0, 0))
-		Delete(b)
-		local alive = 0
-		for _, w in ipairs(wormList) do if w.alive then alive = alive + 1 end end
-		if alive < WORM_MAX then wormList[#wormList + 1] = wormNew(p) end
+		seen[b] = true
+		-- (the spawn menu's preview before the click is a marker too: the menu spawns it with its shapes on collision
+		--  layer 0, mask 0, and the click spawns the real one (mask 255). The countdown starts on the real one.)
+		local m = wormSpawnerTrack[b]
+		if not m then
+			m = {}
+			wormSpawnerTrack[b] = m
+		end
+		if not m.t0 then
+			local shapes = GetBodyShapes(b) or {}
+			local preview = #shapes > 0
+			for _, sh in ipairs(shapes) do
+				local _, mask = GetShapeCollisionFilter(sh)
+				if (mask or 0) ~= 0 then preview = false end
+			end
+			if not preview then m.t0 = t end
+		end
+		local pos = GetBodyTransform(b).pos
+		local left = SPAWN_MARK_T - (t - (m.t0 or t))
+		if not m.t0 then
+			-- (a preview: nothing yet)
+		elseif left <= 0 then
+			Delete(b)
+			wormSpawnerTrack[b] = nil
+			local alive = 0
+			for _, w in ipairs(wormList) do if w.alive then alive = alive + 1 end end
+			if alive < WORM_MAX then wormList[#wormList + 1] = wormNew(VecAdd(pos, Vec(0, 1.0, 0))) end
+		else
+			local k = #marks
+			marks[k + 1], marks[k + 2], marks[k + 3], marks[k + 4] = pos[1], pos[2], pos[3], left
+		end
 	end
+	for b in pairs(wormSpawnerTrack) do
+		if not seen[b] then wormSpawnerTrack[b] = nil end
+	end
+	wormMarks = marks
 end
 
 function Worm.serverTick(dt)
 	local t = now()
 	Nav.tick()
 	wormSpawnTick()
-	if math.floor(t * 2) ~= math.floor((t - dt) * 2) then wormSpawnMenu() end
+	local tenth = math.floor(t * 10) ~= math.floor((t - dt) * 10)
+	if tenth then wormSpawnMenu() end
 	wormTakeHits()
+	wormTakeVehicles()
 	wormTakeApiDamage()
 	-- GetLastSound is the loudest sound of the last frame only: listen every frame, keep the loudest until the senses
 	local sv, sp = GetLastSound()
@@ -926,7 +1128,9 @@ function Worm.serverTick(dt)
 				w.far = wormNearest(w)
 			end
 			wormBoxesMove(w)
+			if tenth then wormBoxesCheck(w) end
 		elseif t - w.deadT > CORPSE_T then
+			ClearKey("villagers.thing.ab" .. tostring(w.id))
 			table.remove(wormList, i)
 			wormRespawnAt[#wormRespawnAt + 1] = t + RESPAWN_T
 		end
@@ -950,6 +1154,7 @@ function Worm.serverTick(dt)
 		wormPubT = t
 		wormPublish()
 	end
+	wormVillagersTick()
 end
 
 function Worm.serverUpdate(dt)

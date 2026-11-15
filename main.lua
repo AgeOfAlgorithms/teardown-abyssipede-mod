@@ -3,6 +3,7 @@
 -- Worm (the brains, server), WormView (drawing and sound, every machine). WORM_PARTS / WORM_SOUNDS are generated.
 
 #include "wormparts.lua"
+#include "wormtrim.lua"
 #include "wormsounds.lua"
 #include "nav.lua"
 #include "worm.lua"
