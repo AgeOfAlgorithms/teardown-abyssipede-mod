@@ -192,10 +192,33 @@ function wormCandidate(lo, hi, minD)
 	end
 	wormFilter()
 	local up, du = QueryRaycast(p, Vec(0, 1, 0), 14)
+	if up and water and wormUnderLand(p) then return nil end    -- (not in the water under an island: a trap)
 	if up then score = score + 2 end                           -- under cover: dark
 	if water then score = score + 2 end
 	if down and dd < 6 then score = score + 1 end
 	return p, score
+end
+
+-- In water under land: the solid over p begins under the water (not a pier, with air under it) and its top stands in
+-- the air (not a wreck's deck, with water over it too). Isla Estocastica's island is a shelf a few metres thick over a
+-- bottomless sea: the water under it scored as a dark, covered lair and was a fine place to wander, and an Abyssipede
+-- in there struggled to find the way out round the shore, often for minutes (seen by players, 2026-11-15). Two rays
+-- and a few water tests. (IsPointInWater is also true inside ground below sea level, so no test is made inside it.)
+UNDERLAND_UP = 40             -- m up from p that the cover is looked for
+UNDERLAND_TOP = 30            -- m over the cover's underside from where its top is looked for, straight down
+
+function wormUnderLand(p)
+	if not IsPointInWater(p) then return false end
+	local x, y, z = p[1], p[2], p[3]
+	wormFilter()
+	local hit, d = QueryRaycast(p, Vec(0, 1, 0), UNDERLAND_UP)
+	if not hit then return false end                             -- open water up to the surface
+	if not IsPointInWater(Vec(x, y + math.max(0, d - 0.15), z)) then return false end   -- (air under it: a pier)
+	local from = y + d + UNDERLAND_TOP
+	wormFilter()
+	local hit2, d2 = QueryRaycast(Vec(x, from, z), Vec(0, -1, 0), UNDERLAND_TOP)
+	local top = hit2 and (from - d2) or (y + d)
+	return not IsPointInWater(Vec(x, top + 0.1, z))              -- (its top in the air: land; in water: a deck)
 end
 
 function wormNew(lair)
@@ -539,6 +562,101 @@ function wormFloorBelow(p)
 	return false
 end
 
+
+-- Villagers as prey, exactly like players (the user, 2026-11-15): the same senses (their noise level is a sound it
+-- hears), the same choice of target and drift toward life, seized and dragged to the lair in its jaws
+-- (villagers.carry.<id>, written every tick), hurt on the way and killed there or at DRAG_MAX, and their punches hurt it
+-- (villagers.strike). Damage in player health (0..1) times VL_HP. A target is "v:<villager id>"; a player's is a number.
+-- Nothing happens without the Villagers mod (villagers.present is false).
+VL_HP = 100                   -- a villager's whole health (a player's is 1)
+VL_NOISE_VOL = 0.2            -- a villager's noise (0..1) as a sound's volume: yelling 0.2, walking 0.06
+VL_STRIKE_K = 0.5             -- a villager's blow (8-20 a punch, on their 100 scale) times this hurts it
+VL_NAME = "a glowing giant centipede"
+
+function wormIsVlTarget(tgt) return type(tgt) == "string" and string.sub(tgt, 1, 2) == "v:" end
+function wormVlId(tgt) return string.sub(tgt, 3) end
+function wormVlAlive(id) return GetBool("villagers.v." .. id .. ".alive") end
+function wormVlChest(id)
+	local b = "villagers.v." .. id .. "."
+	return Vec(GetFloat(b .. "x"), GetFloat(b .. "y") + 1.0, GetFloat(b .. "z"))
+end
+
+-- a target that is still prey: a living player, or a living villager
+function wormPreyOk(tgt)
+	if not tgt or tgt == 0 then return false end
+	if wormIsVlTarget(tgt) then return wormVlAlive(wormVlId(tgt)) end
+	return type(tgt) == "number" and IsPlayerValid(tgt) and GetPlayerHealth(tgt) > 0
+end
+
+function wormPreyChest(tgt)
+	if wormIsVlTarget(tgt) then return wormVlChest(wormVlId(tgt)) end
+	return wormChest(tgt)
+end
+
+-- the villagers alive, every 0.1 s: {id, pos (feet), chest, speed (from their last place), noise, carried}
+function wormVlScan()
+	local t = now()
+	if t < (wormVlScanT or 0) then return end
+	wormVlScanT = t + 0.1
+	local list, known = {}, {}
+	if GetBool("villagers.present") then
+		for id in string.gmatch(GetString("villagers.list"), "[^,]+") do
+			local b = "villagers.v." .. id .. "."
+			if GetBool(b .. "alive") then
+				local pos = Vec(GetFloat(b .. "x"), GetFloat(b .. "y"), GetFloat(b .. "z"))
+				local old = wormVlKnown[id]
+				local speed = 0
+				if old and t > old.t then speed = 0.5 * old.speed + 0.5 * dist(pos, old.pos) / (t - old.t) end
+				local v = {id = id, pos = pos, chest = VecAdd(pos, Vec(0, 1.0, 0)), speed = speed, t = t,
+					noise = GetFloat(b .. "noise"), carried = GetBool(b .. "carried")}
+				list[#list + 1] = v
+				known[id] = v
+			end
+		end
+	end
+	wormVlList, wormVlKnown = list, known
+end
+
+function wormVlFree(v) return not wormGrabbed["v:" .. v.id] and not v.carried end
+
+function wormVlHurt(id, amount, from, knock)
+	if amount <= 0 then return end
+	local n = GetInt("villagers.hurt.last") + 1
+	local b = "villagers.hurt." .. (n % 16) .. "."
+	local f = from or wormVlChest(id)
+	SetString(b .. "target", id)
+	SetString(b .. "shape", "")
+	SetFloat(b .. "amount", amount * VL_HP)
+	SetString(b .. "by", VL_NAME)
+	SetFloat(b .. "x", f[1]); SetFloat(b .. "y", f[2]); SetFloat(b .. "z", f[3])
+	SetFloat(b .. "knock", knock or 0)
+	SetInt("villagers.hurt.last", n)
+end
+
+function wormVlCarry(id, p)
+	local b = "villagers.carry." .. id .. "."
+	SetFloat(b .. "x", p[1]); SetFloat(b .. "y", p[2]); SetFloat(b .. "z", p[3])
+	SetString(b .. "by", VL_NAME)
+end
+
+function wormVlDrop(id) ClearKey("villagers.carry." .. id) end
+
+-- villagers' blows (villagers.strike ring): hurt it as a player's would
+function wormVlStrikes()
+	local last = GetInt("villagers.strike.last")
+	while (wormVlStrikeSeen or last) < last do
+		wormVlStrikeSeen = (wormVlStrikeSeen or last) + 1
+		local b = "villagers.strike." .. (wormVlStrikeSeen % 16) .. "."
+		local id = tonumber(string.match(GetString(b .. "thing"), "^ab(%d+)$") or "")
+		for _, w in ipairs(wormList) do
+			if w.id == id and w.alive then
+				wormDamage(w, GetFloat(b .. "amount") * VL_STRIKE_K, "melee", Vec(GetFloat(b .. "x"), GetFloat(b .. "y"), GetFloat(b .. "z")))
+			end
+		end
+	end
+	wormVlStrikeSeen = last
+end
+
 ----- grab and drag -----
 
 function wormGrab(w, p)
@@ -553,6 +671,7 @@ end
 
 function wormRelease(w)
 	if w.grab ~= 0 then wormGrabbed[w.grab] = nil end
+	if wormIsVlTarget(w.grab) then wormVlDrop(wormVlId(w.grab)) end
 	w.grab = 0
 	w.mouth = 1
 	w.lungeCd = now() + 3
@@ -616,9 +735,25 @@ function wormSense(w)
 			if s > bestS then best, bestS = p, s end
 		end
 	end
+	for _, v in ipairs(wormVlList) do                              -- villagers: as players (they carry no flashlight)
+		if wormVlFree(v) then
+			local d = dist(v.chest, w.pos)
+			local s = 0
+			if d < NEAR_SENSE then s = 3 end
+			if d < MOVE_SENSE and v.speed > 2.5 then s = math.max(s, 2) end
+			if d < DARK_SIGHT and wormClear(w.pos, v.chest, 0.05) then s = math.max(s, 3) end
+			if s > 0 then s = s + 1 / (1 + d) end
+			if s > bestS then best, bestS = "v:" .. v.id, s end
+			if v.noise > 0 and d < v.noise * VL_NOISE_VOL * HEAR_K then   -- (heard, as a sound)
+				w.known = VecCopy(v.chest)
+				w.knownT = now()
+				if w.state == "lurk" then wormSetState(w, "stalk") end
+			end
+		end
+	end
 	if best ~= 0 then
 		w.target = best
-		w.known = wormChest(best)
+		w.known = wormPreyChest(best)
 		w.knownT = now()
 		local d = dist(w.known, w.pos)
 		if bestS >= 3 and (w.state == "lurk" or w.state == "stalk") then
@@ -640,7 +775,7 @@ end
 -- a goal it may wander to: free, and in water or within 10 m above something (it keeps out of the open sky)
 function wormGoalOk(g)
 	if not Nav.free(g) then return false end
-	if IsPointInWater(g) then return true end
+	if IsPointInWater(g) then return not wormUnderLand(g) end   -- (water, but not under an island)
 	wormFilter()
 	return (QueryRaycast(g, Vec(0, -1, 0), 10))
 end
@@ -655,8 +790,14 @@ function wormWanderGoal(w)
 			if d < bd then best, bd = p, d end
 		end
 	end
+	for _, v in ipairs(wormVlList) do                              -- (villagers alike)
+		if wormVlFree(v) then
+			local d = dist(v.chest, w.pos)
+			if d < bd then best, bd = "v:" .. v.id, d end
+		end
+	end
 	if best and math.random() < ((w.far or 0) > ROAM_D and 0.9 or 0.6) then
-		local c = wormChest(best)
+		local c = wormPreyChest(best)
 		local spread = math.max(6, math.min(24, bd * 0.4))
 		for _ = 1, 6 do
 			local g = VecAdd(c, Vec((math.random() - 0.5) * 2 * spread, (math.random() - 0.5) * 4, (math.random() - 0.5) * 2 * spread))
@@ -754,6 +895,7 @@ function wormNearest(w)
 	for _, p in ipairs(GetAllPlayers()) do
 		if GetPlayerHealth(p) > 0 then best = math.min(best, dist(wormChest(p), w.pos)) end
 	end
+	for _, v in ipairs(wormVlList) do best = math.min(best, dist(v.chest, w.pos)) end
 	return best
 end
 
@@ -856,8 +998,8 @@ function wormUpdate(w, dt)
 	if w.state == "windup" then
 		w.mouth = math.min(1, 0.2 + (now() - w.stateT) / WINDUP_T)
 		w.speed = 0
-		if w.target ~= 0 and IsPlayerValid(w.target) then
-			w.fwd = VecNormalize(VecLerp(w.fwd, VecNormalize(VecSub(wormChest(w.target), w.pos)), math.min(1, 10 * dt)))
+		if wormPreyOk(w.target) then
+			w.fwd = VecNormalize(VecLerp(w.fwd, VecNormalize(VecSub(wormPreyChest(w.target), w.pos)), math.min(1, 10 * dt)))
 		end
 		if now() - w.stateT > WINDUP_T then
 			wormSetState(w, "lunge")
@@ -866,7 +1008,7 @@ function wormUpdate(w, dt)
 		return
 	elseif w.state == "lunge" then
 		w.mouth = 1
-		local tgt = (w.target ~= 0 and IsPlayerValid(w.target)) and wormChest(w.target) or VecAdd(w.pos, w.fwd)
+		local tgt = wormPreyOk(w.target) and wormPreyChest(w.target) or VecAdd(w.pos, w.fwd)
 		local d = VecNormalize(VecSub(tgt, w.pos))
 		w.fwd = VecNormalize(VecLerp(w.fwd, d, math.min(1, 6 * dt)))
 		local nxt = VecAdd(w.pos, VecScale(w.fwd, LUNGE_SPEED * dt))
@@ -876,9 +1018,8 @@ function wormUpdate(w, dt)
 		else
 			wormBite(w, w.fwd)                                      -- (it strikes through cover)
 		end
-		if w.target ~= 0 and IsPlayerValid(w.target) and GetPlayerHealth(w.target) > 0 and not wormGrabbed[w.target]
-			and dist(wormJaw(w), tgt) < GRAB_R then
-			if GetPlayerVehicle(w.target) ~= 0 then
+		if wormPreyOk(w.target) and not wormGrabbed[w.target] and dist(wormJaw(w), tgt) < GRAB_R then
+			if type(w.target) == "number" and GetPlayerVehicle(w.target) ~= 0 then
 				wormBite(w, w.fwd)
 				wormSetState(w, "chase")
 			else
@@ -893,16 +1034,21 @@ function wormUpdate(w, dt)
 		return
 	elseif w.state == "drag" then
 		local p = w.grab
-		if p == 0 or not IsPlayerValid(p) or GetPlayerHealth(p) <= 0 then
+		if not wormPreyOk(p) then
 			wormRelease(w)
 			wormSetState(w, "lurk")
 		else
-			SetPlayerHealth(math.max(0, GetPlayerHealth(p) - DRAG_HURT * dt), p)
+			if wormIsVlTarget(p) then                               -- (a villager: as a player, in their 100s)
+				w.vlDragHurt = (w.vlDragHurt or 0) + DRAG_HURT * dt
+				if w.vlDragHurt * VL_HP >= 1 then wormVlHurt(wormVlId(p), w.vlDragHurt, w.pos, 0); w.vlDragHurt = 0 end
+			else
+				SetPlayerHealth(math.max(0, GetPlayerHealth(p) - DRAG_HURT * dt), p)
+			end
 			if w.dmgInDrag >= RELEASE_DMG then            -- (the only way out: hurting it; no struggling free)
 				wormRelease(w)
 				wormSetState(w, "flee")
 			elseif dist(w.pos, w.lair) < 2.5 or now() - w.grabT > DRAG_MAX then
-				SetPlayerHealth(0, p)
+				if wormIsVlTarget(p) then wormVlHurt(wormVlId(p), 1, w.pos, 0) else SetPlayerHealth(0, p) end
 				w.ev.bite = w.ev.bite + 1
 				wormRelease(w)
 				wormSetState(w, "lurk")
@@ -915,8 +1061,8 @@ function wormUpdate(w, dt)
 	elseif w.state == "lurk" then
 		w.hp = math.min(HP, w.hp + 1.5 * dt)
 	end
-	if w.state == "chase" and w.target ~= 0 and IsPlayerValid(w.target) and now() > w.lungeCd and w.seeing then
-		local c = wormChest(w.target)
+	if w.state == "chase" and wormPreyOk(w.target) and now() > w.lungeCd and w.seeing then
+		local c = wormPreyChest(w.target)
 		if dist(c, w.pos) < LUNGE_RANGE and wormClear(w.pos, c, 0.1) then
 			wormSetState(w, "windup")
 			return
@@ -928,6 +1074,7 @@ end
 -- the victim is held in the jaws (after physics, over Dive's swimming and the player's own moves)
 function wormHold(w)
 	local p = w.grab
+	if wormIsVlTarget(p) then wormVlCarry(wormVlId(p), wormJaw(w)); return end   -- (a villager: the point they hang from)
 	if p == 0 or not IsPlayerValid(p) then return end
 	local jaw = wormJaw(w)
 	local t = GetPlayerTransform(p)
@@ -948,9 +1095,7 @@ function wormVillagersInit()
 	SetString(b .. "note", "as long as a house is wide, it glows in the dark, bites through walls and drags people off")
 	SetString(b .. "sound", "a dry clicking")
 	SetFloat(b .. "hear", 25)
-	SetString(b .. "feel.wren", "curious")                  -- Lucy, the reckless apprentice, wants a look
-	SetString(b .. "feel.brannoc", "hate")                  -- Frank the smith and Walter the shepherd stand and fight
-	SetString(b .. "feel.eskil", "hate")
+	-- (no feelings per villager: each villager judges a kind for themselves from its note and danger)
 end
 
 local VL_DOING = {lurk = "crawling about", stalk = "creeping closer", chase = "charging", windup = "rearing up to strike",
@@ -1014,6 +1159,8 @@ function Worm.serverInit()
 	SetString("abyssipede.damage", "")
 	wormVillagersInit()
 	wormVlT = 0
+	wormVlList, wormVlKnown, wormVlScanT = {}, {}, 0
+	wormVlStrikeSeen = GetInt("villagers.strike.last")
 	local c = GetInt("savegame.mod.count")
 	if c < 1 then c = 1 end
 	WORM_COUNT = math.min(3, c)
@@ -1110,6 +1257,8 @@ function Worm.serverTick(dt)
 	local t = now()
 	Nav.tick()
 	wormSpawnTick()
+	wormVlScan()
+	wormVlStrikes()
 	local tenth = math.floor(t * 10) ~= math.floor((t - dt) * 10)
 	if tenth then wormSpawnMenu() end
 	wormTakeHits()
