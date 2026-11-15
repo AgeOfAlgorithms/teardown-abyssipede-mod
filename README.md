@@ -20,6 +20,12 @@ Shoot it (the head hurts most), blow it up, hit it with a sledge. On the **Titan
 - **Options** in the Mod Manager: 1 to 3 on each map.
 - The host can place more from the spawn menu (Creatures > Abyssipede), up to 6.
 
+## With AI Villagers of Dunmarrow
+If [AI Villagers of Dunmarrow](https://steamcommunity.com/sharedfiles/filedetails/?id=3840579200) is on, the Abyssipede hunts the villagers exactly as it hunts players: it senses them, seizes them and drags them off to its lair. The villagers see it, fear it and run, and they can fight back.
+
+## With the McPuppet Inventory System
+If the [McPuppet Inventory System](https://steamcommunity.com/sharedfiles/filedetails/?id=3840357667) is on, a dead Abyssipede drops 400 gold to pick up.
+
 ## Multiplayer
 The host turns it on under Global mods. Each player's game draws the body itself; the host runs the brain.
 
